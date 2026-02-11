@@ -1,6 +1,7 @@
 const express = require("express");
-const cors = require("cors");
 const axios = require("axios");
+const cheerio = require("cheerio");
+const cors = require("cors");
 
 const app = express();
 app.use(cors());
@@ -8,227 +9,223 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-/* ===============================
-   🧠 SIMPLE IN-MEMORY CACHE
-   =============================== */
+/* =========================================================
+   TEMP SESSION STORAGE (Simple In-Memory)
+   NOTE: This resets if server restarts (OK for Render free)
+========================================================= */
 
-const resultCache = new Map();
-const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
+let sessionCookie = "";
+let captchaIdentifier = "";
 
-function getCacheKey(boid, companyId) {
-  return `${boid}_${companyId}`;
-}
+/* =========================================================
+   HEALTH CHECK
+========================================================= */
 
-function getCachedResult(boid, companyId) {
-  const key = getCacheKey(boid, companyId);
-  const cached = resultCache.get(key);
-
-  if (!cached) return null;
-
-  if (Date.now() - cached.timestamp > CACHE_DURATION) {
-    resultCache.delete(key);
-    return null;
-  }
-
-  return cached.data;
-}
-
-function setCachedResult(boid, companyId, data) {
-  const key = getCacheKey(boid, companyId);
-  resultCache.set(key, {
-    data,
-    timestamp: Date.now(),
+app.get("/", (req, res) => {
+  res.json({
+    success: true,
+    message: "IPO Backend Running",
   });
-}
-
-/* ===============================
-   🚦 RATE LIMIT (Basic Protection)
-   =============================== */
-
-let requestCount = 0;
-const MAX_REQUESTS_PER_MINUTE = 100;
-
-setInterval(() => {
-  requestCount = 0;
-}, 60 * 1000);
-
-app.use((req, res, next) => {
-  requestCount++;
-  if (requestCount > MAX_REQUESTS_PER_MINUTE) {
-    return res.status(429).json({
-      success: false,
-      message: "Too many requests. Try again later.",
-    });
-  }
-  next();
 });
 
-/* ===============================
-   1️⃣ COMPANY LIST
-   =============================== */
+/* =========================================================
+   FETCH CAPTCHA + SESSION
+========================================================= */
 
-app.get("/ipo/companies", (req, res) => {
+app.get("/ipo/get-captcha", async (req, res) => {
   try {
-    const companies = require("./companies.json");
-
-    res.json({
-      success: true,
-      count: companies.length,
-      companies: companies,
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Failed to load companies",
-    });
-  }
-});
-
-/* ===============================
-   2️⃣ SINGLE RESULT CHECK
-   =============================== */
-
-app.get("/ipo/check", async (req, res) => {
-  const { boid, companyId } = req.query;
-
-  if (!boid || !companyId) {
-    return res.status(400).json({
-      success: false,
-      message: "Missing boid or companyId",
-    });
-  }
-
-  const cached = getCachedResult(boid, companyId);
-  if (cached) {
-    return res.json({
-      success: true,
-      cached: true,
-      ...cached,
-    });
-  }
-
-  try {
-    const response = await axios.post(
+    const response = await axios.get(
       "https://iporesult.cdsc.com.np/",
-      new URLSearchParams({
-        boid,
-        companyShareId: companyId,
-      }).toString(),
       {
         headers: {
-          "Content-Type": "application/x-www-form-urlencoded",
           "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
         },
-        timeout: 15000,
       }
     );
 
-    const html = response.data.toLowerCase();
+    /* ---------- Extract session cookie ---------- */
 
-    let allotted = false;
-
-    if (html.includes("not allotted")) {
-      allotted = false;
-    } else if (html.includes("allotted")) {
-      allotted = true;
+    const cookies = response.headers["set-cookie"];
+    if (cookies) {
+      sessionCookie = cookies
+        .map((c) => c.split(";")[0])
+        .join("; ");
     }
 
-    const result = { boid, companyId, allotted };
+    /* ---------- Parse HTML ---------- */
 
-    setCachedResult(boid, companyId, result);
+    const $ = cheerio.load(response.data);
+
+    captchaIdentifier = $("input[name='captchaIdentifier']")
+      .attr("value");
+
+    const captchaImagePath =
+      $("img[id='captcha-image']").attr("src");
+
+    if (!captchaIdentifier || !captchaImagePath) {
+      return res.status(500).json({
+        success: false,
+        message: "Captcha parsing failed",
+      });
+    }
+
+    const captchaUrl =
+      "https://iporesult.cdsc.com.np" +
+      captchaImagePath;
 
     res.json({
       success: true,
-      ...result,
+      captchaIdentifier,
+      captchaUrl,
     });
   } catch (error) {
     res.status(500).json({
       success: false,
-      message: "CDSC request failed",
+      message: "Failed to fetch captcha",
+      error: error.message,
     });
   }
 });
 
-/* ===============================
-   3️⃣ BULK CHECK (NEW 🔥)
-   =============================== */
+/* =========================================================
+   BULK CHECK WITH CAPTCHA VALIDATION
+========================================================= */
 
-app.post("/ipo/bulk-check", express.json(), async (req, res) => {
-  const { boids, companyId } = req.body;
+app.post("/ipo/bulk-check", async (req, res) => {
+  const { companyId, boids, usercaptcha } = req.body;
 
-  if (!boids || !Array.isArray(boids) || !companyId) {
+  if (!companyId || !boids || !usercaptcha) {
     return res.status(400).json({
       success: false,
-      message: "Invalid request body",
+      message: "Missing parameters",
+    });
+  }
+
+  if (!sessionCookie || !captchaIdentifier) {
+    return res.status(400).json({
+      success: false,
+      message: "Captcha session expired. Fetch captcha again.",
     });
   }
 
   const results = [];
 
-  for (const boid of boids) {
-    try {
-      const cached = getCachedResult(boid, companyId);
-      if (cached) {
-        results.push({ ...cached, cached: true });
-        continue;
+  try {
+    /* ----------------------------------------------------
+       STEP 1: Validate captcha using first BOID
+    ---------------------------------------------------- */
+
+    const firstCheck = await axios.post(
+      "https://iporesult.cdsc.com.np/result/result/check",
+      {
+        companyShareId: companyId,
+        boid: boids[0],
+        captchaIdentifier,
+        usercaptcha,
+      },
+      {
+        headers: {
+          "Content-Type": "application/json",
+          Cookie: sessionCookie,
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        },
       }
+    );
 
-      const response = await axios.post(
-        "https://iporesult.cdsc.com.np/",
-        new URLSearchParams({
-          boid,
-          companyShareId: companyId,
-        }).toString(),
-        {
-          headers: {
-            "Content-Type":
-              "application/x-www-form-urlencoded",
-            "User-Agent":
-              "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-          },
-          timeout: 15000,
-        }
-      );
+    /* ---------- Detect wrong captcha ---------- */
 
-      const html = response.data.toLowerCase();
+    if (
+      firstCheck.data.success === false &&
+      firstCheck.data.message &&
+      firstCheck.data.message
+        .toLowerCase()
+        .includes("captcha")
+    ) {
+      sessionCookie = "";
+      captchaIdentifier = "";
 
-      let allotted = false;
-
-      if (html.includes("not allotted")) {
-        allotted = false;
-      } else if (html.includes("allotted")) {
-        allotted = true;
-      }
-
-      const result = { boid, companyId, allotted };
-
-      setCachedResult(boid, companyId, result);
-      results.push(result);
-    } catch (e) {
-      results.push({
-        boid,
-        companyId,
-        allotted: false,
-        error: true,
+      return res.json({
+        success: false,
+        captchaError: true,
+        message: "Invalid captcha",
       });
     }
+
+    /* ---------- Add first result ---------- */
+
+    results.push({
+      boid: boids[0],
+      allotted: firstCheck.data.success === true,
+      message: firstCheck.data.message,
+    });
+
+    /* ----------------------------------------------------
+       STEP 2: Process remaining BOIDs
+    ---------------------------------------------------- */
+
+    for (let i = 1; i < boids.length; i++) {
+      const boid = boids[i];
+
+      try {
+        const response = await axios.post(
+          "https://iporesult.cdsc.com.np/result/result/check",
+          {
+            companyShareId: companyId,
+            boid,
+            captchaIdentifier,
+            usercaptcha,
+          },
+          {
+            headers: {
+              "Content-Type": "application/json",
+              Cookie: sessionCookie,
+              "User-Agent":
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            },
+          }
+        );
+
+        results.push({
+          boid,
+          allotted: response.data.success === true,
+          message: response.data.message,
+        });
+      } catch (error) {
+        results.push({
+          boid,
+          allotted: false,
+          message: "Error checking result",
+        });
+      }
+    }
+
+    /* ---------- Clear session after use ---------- */
+
+    sessionCookie = "";
+    captchaIdentifier = "";
+
+    res.json({
+      success: true,
+      count: results.length,
+      results,
+    });
+  } catch (error) {
+    sessionCookie = "";
+    captchaIdentifier = "";
+
+    res.status(500).json({
+      success: false,
+      message: "Bulk check failed",
+      error: error.message,
+    });
   }
-
-  res.json({
-    success: true,
-    count: results.length,
-    results,
-  });
 });
 
-/* ===============================
-   ROOT
-   =============================== */
-
-app.get("/", (req, res) => {
-  res.send("IPO Backend API Running 🚀");
-});
+/* =========================================================
+   START SERVER
+========================================================= */
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
