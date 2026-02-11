@@ -4,6 +4,7 @@ const axios = require("axios");
 
 const app = express();
 app.use(cors());
+app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
@@ -186,6 +187,7 @@ app.post("/ipo/bulk-check", express.json(), async (req, res) => {
             "User-Agent":
               "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
           },
+          timeout: 15000,
         }
       );
 
