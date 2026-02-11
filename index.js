@@ -2,6 +2,8 @@ const express = require("express");
 const axios = require("axios");
 const cheerio = require("cheerio");
 const cors = require("cors");
+const fs = require("fs");
+const path = require("path");
 
 const app = express();
 app.use(cors());
@@ -10,8 +12,7 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 
 /* =========================================================
-   TEMP SESSION STORAGE (Simple In-Memory)
-   NOTE: This resets if server restarts (OK for Render free)
+   TEMP SESSION STORAGE (In-Memory)
 ========================================================= */
 
 let sessionCookie = "";
@@ -26,6 +27,38 @@ app.get("/", (req, res) => {
     success: true,
     message: "IPO Backend Running",
   });
+});
+
+/* =========================================================
+   LOAD COMPANY LIST FROM company.json
+========================================================= */
+
+app.get("/ipo/companies", (req, res) => {
+  try {
+    const filePath = path.join(__dirname, "companies.json");
+
+    if (!fs.existsSync(filePath)) {
+      return res.status(500).json({
+        success: false,
+        message: "company.json not found",
+      });
+    }
+
+    const rawData = fs.readFileSync(filePath);
+    const companies = JSON.parse(rawData);
+
+    res.json({
+      success: true,
+      count: companies.length,
+      companies,
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Failed to load company list",
+      error: error.message,
+    });
+  }
 });
 
 /* =========================================================
@@ -44,16 +77,12 @@ app.get("/ipo/get-captcha", async (req, res) => {
       }
     );
 
-    /* ---------- Extract session cookie ---------- */
-
     const cookies = response.headers["set-cookie"];
     if (cookies) {
       sessionCookie = cookies
         .map((c) => c.split(";")[0])
         .join("; ");
     }
-
-    /* ---------- Parse HTML ---------- */
 
     const $ = cheerio.load(response.data);
 
@@ -112,9 +141,7 @@ app.post("/ipo/bulk-check", async (req, res) => {
   const results = [];
 
   try {
-    /* ----------------------------------------------------
-       STEP 1: Validate captcha using first BOID
-    ---------------------------------------------------- */
+    /* ---------- Validate captcha with first BOID ---------- */
 
     const firstCheck = await axios.post(
       "https://iporesult.cdsc.com.np/result/result/check",
@@ -134,8 +161,6 @@ app.post("/ipo/bulk-check", async (req, res) => {
       }
     );
 
-    /* ---------- Detect wrong captcha ---------- */
-
     if (
       firstCheck.data.success === false &&
       firstCheck.data.message &&
@@ -153,17 +178,13 @@ app.post("/ipo/bulk-check", async (req, res) => {
       });
     }
 
-    /* ---------- Add first result ---------- */
-
     results.push({
       boid: boids[0],
       allotted: firstCheck.data.success === true,
       message: firstCheck.data.message,
     });
 
-    /* ----------------------------------------------------
-       STEP 2: Process remaining BOIDs
-    ---------------------------------------------------- */
+    /* ---------- Process remaining BOIDs ---------- */
 
     for (let i = 1; i < boids.length; i++) {
       const boid = boids[i];
@@ -200,8 +221,6 @@ app.post("/ipo/bulk-check", async (req, res) => {
         });
       }
     }
-
-    /* ---------- Clear session after use ---------- */
 
     sessionCookie = "";
     captchaIdentifier = "";
